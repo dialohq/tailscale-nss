@@ -1,0 +1,34 @@
+[package]
+name = "tailscale-nss"
+version = "0.1.0"
+edition = "2021"
+description = "NSS plugin that synthesizes UNIX users from a tailnet's peer list"
+license = "MIT"
+
+[lib]
+# `libnss_<name>.so.2` is what glibc looks for. cdylib gives us a clean .so
+# without Rust runtime symbol leakage. The `.2` suffix is added at install time.
+name = "nss_tailscale"
+crate-type = ["cdylib"]
+
+[dependencies]
+libnss = "0.8"
+# `libnss`'s `libnss_*_hooks!` macros expand to code that references
+# `libc::passwd`, `libc::group`, errno constants, etc. directly, so we have
+# to declare libc in the consumer crate, not just transitively.
+libc = "0.2"
+# `libnss` requires `paste` for its export macros.
+paste = "1"
+# Lazy-init for static configuration read from env vars.
+once_cell = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# NSS plugins are loaded into every NSS-using process (sshd, ls, ps, ...).
+# Optimize for size and avoid panics-as-unwinds (would corrupt the host).
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
