@@ -13,15 +13,40 @@ metadata, so it works on any host that can run tailscaled.
 
 ## Status
 
-Scaffold. `getpwnam` / `getpwuid` / `getpwent` work end-to-end against a
-local tailscaled. **Not yet hardened**:
+Builds clean (rust 1.94, clippy with `-D warnings`), 10 tests pass.
 
-- [ ] In-memory cache (currently every NSS lookup hits tailscaled — fine for
-      a small tailnet, but `ls -l` on a busy directory will fan out)
-- [ ] Background poller daemon to decouple NSS latency from network latency
-- [ ] Group membership (only "primary group per user" today)
-- [ ] PAM mkhomedir integration to auto-create `/home/<user>` on first login
-- [ ] Failure-mode tests (tailscaled down, slow, returning garbage)
+What works:
+
+- [x] `getpwnam` / `getpwuid` / `getpwent` (and group equivalents) via the
+      tailscaled local API socket (`/localapi/v0/status`)
+- [x] Stable FNV-1a-derived UIDs in `[100000, INT32_MAX)` — same input
+      always produces the same UID, so persistent home dirs survive
+      container restarts without `chown` storms
+- [x] 5s in-process cache (single tailscaled hit serves `ls -l` of an
+      N-file directory)
+- [x] Graceful degradation: serve last-known-good cache on transient
+      failures (tailscaled briefly down)
+- [x] Hard 250ms timeout on every tailscaled call (NSS plugins are
+      `dlopen`'d into sshd, ls, ps, sudo, login shells — a hung daemon
+      must not wedge the host process)
+- [x] `panic = "abort"` + Mutex-poisoning recovery (panicking through libc
+      via FFI is not safe; we make sure we don't, and recover if we did)
+- [x] Hand-rolled HTTP/1.0 over UnixStream (no async runtime baggage in a
+      `dlopen`'d plugin)
+- [x] Fail-closed on missing `TAILSCALE_NSS_DOMAIN` (won't accidentally
+      synthesize every tailnet peer as a UNIX user)
+- [x] Failure-mode tests: missing socket / HTTP 500 / malformed JSON /
+      slow server exceeding timeout — all return `Err` cleanly, none hang
+      or panic
+
+Still outstanding (next pass):
+
+- [ ] Background poller daemon (so the *first* lookup after cache expiry
+      also stays under 50ms)
+- [ ] Real group membership beyond "primary group per user"
+- [ ] PAM `mkhomedir` integration so `/home/<user>` exists on first login
+- [ ] Image integration: glibc override to install the `.so` where nix's
+      glibc looks for it; `/etc/nsswitch.conf` patch in `remote-devenv.nix`
 
 ## Building
 
