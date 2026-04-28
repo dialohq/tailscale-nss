@@ -1,0 +1,240 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A single in-flight run per ref keeps the queue clean when force-pushing.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build + test (linux)
+    # Linux runner is non-negotiable: we are testing a glibc NSS plugin and
+    # the integration job below `dlopen`s the resulting `.so` from `getent`.
+    # Darwin can't run that path at all (no NSS).
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          # Match the rust + cargo versions the dev shell exposes; pinning the
+          # nix-action's channel keeps CI reproducible across nixpkgs drift.
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Cargo deps and the rust toolchain together are the bulk of CI cost;
+      # caching the cargo registry across runs cuts cold-start time roughly
+      # in half. The nix store cache is handled by cachix below.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: cargo test
+        # We run via `nix shell` rather than rustup so the toolchain matches
+        # the nix-built artifact exactly. No version skew.
+        run: nix shell nixpkgs#cargo nixpkgs#rustc -c cargo test --all-targets
+
+      - name: cargo clippy
+        run: nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#clippy -c cargo clippy --all-targets -- -D warnings
+
+      - name: nix build (release artifact)
+        run: nix build .#packages.x86_64-linux.default --print-build-logs
+
+      - name: confirm NSS exports
+        # If the build succeeds but doesn't export the symbols glibc looks
+        # for, the plugin is silently broken at runtime — `getent passwd`
+        # just returns the static /etc/passwd. Catch that here.
+        run: |
+          set -e
+          missing=
+          for sym in \
+            _nss_tailscale_getpwnam_r \
+            _nss_tailscale_getpwuid_r \
+            _nss_tailscale_getpwent_r \
+            _nss_tailscale_setpwent \
+            _nss_tailscale_endpwent \
+            _nss_tailscale_getgrnam_r \
+            _nss_tailscale_getgrgid_r \
+            _nss_tailscale_getgrent_r \
+            _nss_tailscale_setgrent \
+            _nss_tailscale_endgrent
+          do
+            if ! nm -D --defined-only result/lib/libnss_tailscale.so.2 | grep -q " T $sym$"; then
+              missing="$missing $sym"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "missing NSS symbols:$missing" >&2
+            exit 1
+          fi
+          echo "all 10 NSS exports present"
+
+      - name: confirm daemon binary
+        run: |
+          test -x result/bin/tailscale-nss-syncd
+          file result/bin/tailscale-nss-syncd | grep -q "ELF 64-bit LSB"
+
+      # Stash the artifacts so the integration job can pick them up without
+      # rebuilding. The sources are just a couple of MB; keeping them as
+      # workflow artifacts is much cheaper than recompiling Rust.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-nss-build
+          path: |
+            result/lib/libnss_tailscale.so.2
+            result/bin/tailscale-nss-syncd
+          retention-days: 7
+
+  integration:
+    name: getent against mock tailscaled
+    needs: build-and-test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tailscale-nss-build
+          path: artifacts
+
+      - name: install plugin where glibc looks for it
+        # Ubuntu runners use the distro's glibc; the convention is
+        # `/lib/x86_64-linux-gnu/libnss_<name>.so.2`. `chmod +x` because
+        # `actions/upload-artifact` strips the execute bit on tarball
+        # round-trip and glibc won't load a non-executable .so.
+        run: |
+          sudo install -m 0755 \
+            artifacts/libnss_tailscale.so.2 \
+            /lib/x86_64-linux-gnu/libnss_tailscale.so.2
+          sudo ldconfig -n /lib/x86_64-linux-gnu/
+
+      - name: register plugin in nsswitch.conf
+        # Append `tailscale` after `files` so system users (root, the
+        # runner's own account, etc.) still resolve via the canonical path.
+        # If our plugin breaks, login still works.
+        run: |
+          sudo sed -i \
+            's/^passwd:.*$/passwd:    files tailscale systemd/; s/^group:.*$/group:    files tailscale systemd/' \
+            /etc/nsswitch.conf
+          cat /etc/nsswitch.conf
+
+      - name: stand up mock tailscaled
+        # Tiny python "tailscaled" that listens on the canonical socket
+        # path and answers /localapi/v0/status with a fixed peer list.
+        # Backgrounds itself; the cleanup step kills it.
+        run: |
+          sudo mkdir -p /var/run/tailscale
+          sudo chmod 0755 /var/run/tailscale
+          cat <<'PY' | sudo tee /tmp/mock_tailscaled.py >/dev/null
+          import json, os, socket, threading
+          SOCKET = "/var/run/tailscale/tailscaled.sock"
+          PAYLOAD = json.dumps({
+              "User": {
+                  "1": {"LoginName": "alice@dialo.ai"},
+                  "2": {"LoginName": "bob@dialo.ai"},
+                  "3": {"LoginName": "stranger@other.com"},
+              }
+          }).encode()
+          try: os.unlink(SOCKET)
+          except FileNotFoundError: pass
+          srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          srv.bind(SOCKET)
+          os.chmod(SOCKET, 0o666)
+          srv.listen(8)
+          def handle(c):
+              try:
+                  buf = b""
+                  while b"\r\n\r\n" not in buf:
+                      chunk = c.recv(4096)
+                      if not chunk: break
+                      buf += chunk
+                  resp = (
+                      b"HTTP/1.0 200 OK\r\n"
+                      b"Content-Type: application/json\r\n"
+                      b"Content-Length: " + str(len(PAYLOAD)).encode() + b"\r\n\r\n"
+                      + PAYLOAD
+                  )
+                  c.sendall(resp)
+              finally:
+                  c.close()
+          while True:
+              c, _ = srv.accept()
+              threading.Thread(target=handle, args=(c,), daemon=True).start()
+          PY
+          sudo nohup python3 /tmp/mock_tailscaled.py >/tmp/mock_tailscaled.log 2>&1 &
+          for _ in $(seq 50); do
+            [ -S /var/run/tailscale/tailscaled.sock ] && break
+            sleep 0.1
+          done
+          test -S /var/run/tailscale/tailscaled.sock
+
+      - name: getent passwd alice resolves via plugin
+        # The actual "does it work end-to-end" assertion. `getent passwd`
+        # on a username NOT in /etc/passwd will only return non-empty if
+        # an NSS plugin synthesizes it — and the only one that should is
+        # ours.
+        env:
+          TAILSCALE_NSS_DOMAIN: dialo.ai
+        run: |
+          set -e
+
+          # Sanity: alice is NOT in /etc/passwd
+          if grep -q '^alice:' /etc/passwd; then
+            echo "alice already in /etc/passwd; test would be meaningless" >&2
+            exit 1
+          fi
+
+          # Resolve via NSS. `getent` itself loads NSS plugins from the
+          # current /etc/nsswitch.conf, so this is the same code path
+          # sshd, ls, ps, sudo, etc. would take.
+          out=$(getent passwd alice)
+          echo "got: $out"
+
+          # Format: alice:x:<uid>:<gid>:alice@dialo.ai:/home/alice:/bin/bash
+          echo "$out" | grep -q "^alice:" || { echo "no alice line"; exit 1; }
+          echo "$out" | grep -q "alice@dialo.ai" || { echo "no email gecos"; exit 1; }
+          echo "$out" | grep -q "/home/alice" || { echo "no home dir"; exit 1; }
+
+          # bob is also resolvable
+          getent passwd bob | grep -q "bob@dialo.ai"
+
+          # stranger@other.com is filtered out by domain; must NOT resolve
+          if getent passwd stranger; then
+            echo "domain filter broken: stranger@other.com leaked through"
+            exit 1
+          fi
+
+          # UIDs must be deterministic across calls (this is the chown-storm
+          # invariant for persisted home dirs).
+          uid_a=$(getent passwd alice | cut -d: -f3)
+          uid_b=$(getent passwd alice | cut -d: -f3)
+          [ "$uid_a" = "$uid_b" ] || { echo "uid not stable: $uid_a vs $uid_b"; exit 1; }
+
+      - name: getent passwd by uid resolves
+        env:
+          TAILSCALE_NSS_DOMAIN: dialo.ai
+        run: |
+          set -e
+          uid=$(getent passwd alice | cut -d: -f3)
+          back=$(getent passwd "$uid")
+          echo "$back" | grep -q "^alice:" || { echo "uid->name lookup broken"; exit 1; }
+
+      - name: cleanup mock tailscaled
+        if: always()
+        run: |
+          sudo pkill -f mock_tailscaled.py || true
+          sudo rm -f /var/run/tailscale/tailscaled.sock
