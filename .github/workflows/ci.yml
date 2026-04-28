@@ -90,12 +90,26 @@ jobs:
       # Stash the artifacts so the integration job can pick them up without
       # rebuilding. The sources are just a couple of MB; keeping them as
       # workflow artifacts is much cheaper than recompiling Rust.
+      #
+      # Stage to a flat directory first because:
+      #   1. `result/` is a symlink into /nix/store, and upload-artifact has
+      #      a long history of mishandling symlinks (especially across the
+      #      v3 → v4 migration).
+      #   2. v4 derives the archive layout from the least-common-ancestor of
+      #      `path:` entries, which means the archive ends up with
+      #      `lib/libnss_tailscale.so.2` and `bin/tailscale-nss-syncd`
+      #      subdirs — fine, but more brittle than just naming the files.
+      - name: stage artifacts
+        run: |
+          mkdir -p stage
+          cp -L result/lib/libnss_tailscale.so.2 stage/
+          cp -L result/bin/tailscale-nss-syncd stage/
+          chmod +x stage/*
+
       - uses: actions/upload-artifact@v4
         with:
           name: tailscale-nss-build
-          path: |
-            result/lib/libnss_tailscale.so.2
-            result/bin/tailscale-nss-syncd
+          path: stage/
           retention-days: 7
 
   integration:
