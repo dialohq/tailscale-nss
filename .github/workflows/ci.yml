@@ -147,49 +147,15 @@ jobs:
           cat /etc/nsswitch.conf
 
       - name: stand up mock tailscaled
-        # Tiny python "tailscaled" that listens on the canonical socket
-        # path and answers /localapi/v0/status with a fixed peer list.
-        # Backgrounds itself; the cleanup step kills it.
+        # The script lives under tests/ so it's also usable for manual
+        # local NSS testing without joining a real tailnet. Backgrounded
+        # here; the cleanup step kills it.
         run: |
           sudo mkdir -p /var/run/tailscale
           sudo chmod 0755 /var/run/tailscale
-          cat <<'PY' | sudo tee /tmp/mock_tailscaled.py >/dev/null
-          import json, os, socket, threading
-          SOCKET = "/var/run/tailscale/tailscaled.sock"
-          PAYLOAD = json.dumps({
-              "User": {
-                  "1": {"LoginName": "alice@dialo.ai"},
-                  "2": {"LoginName": "bob@dialo.ai"},
-                  "3": {"LoginName": "stranger@other.com"},
-              }
-          }).encode()
-          try: os.unlink(SOCKET)
-          except FileNotFoundError: pass
-          srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-          srv.bind(SOCKET)
-          os.chmod(SOCKET, 0o666)
-          srv.listen(8)
-          def handle(c):
-              try:
-                  buf = b""
-                  while b"\r\n\r\n" not in buf:
-                      chunk = c.recv(4096)
-                      if not chunk: break
-                      buf += chunk
-                  resp = (
-                      b"HTTP/1.0 200 OK\r\n"
-                      b"Content-Type: application/json\r\n"
-                      b"Content-Length: " + str(len(PAYLOAD)).encode() + b"\r\n\r\n"
-                      + PAYLOAD
-                  )
-                  c.sendall(resp)
-              finally:
-                  c.close()
-          while True:
-              c, _ = srv.accept()
-              threading.Thread(target=handle, args=(c,), daemon=True).start()
-          PY
-          sudo nohup python3 /tmp/mock_tailscaled.py >/tmp/mock_tailscaled.log 2>&1 &
+          sudo nohup python3 tests/mock_tailscaled.py \
+            --socket /var/run/tailscale/tailscaled.sock \
+            >/tmp/mock_tailscaled.log 2>&1 &
           for _ in $(seq 50); do
             [ -S /var/run/tailscale/tailscaled.sock ] && break
             sleep 0.1
