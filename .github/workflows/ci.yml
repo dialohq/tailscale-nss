@@ -165,44 +165,60 @@ jobs:
       - name: getent passwd alice resolves via plugin
         # The actual "does it work end-to-end" assertion. `getent passwd`
         # on a username NOT in /etc/passwd will only return non-empty if
-        # an NSS plugin synthesizes it — and the only one that should is
-        # ours.
+        # an NSS plugin synthesizes it — and the only one that should be
+        # answering is ours.
         env:
           TAILSCALE_NSS_DOMAIN: dialo.ai
         run: |
           set -e
 
-          # Sanity: alice is NOT in /etc/passwd
+          # Sanity: alice is NOT in /etc/passwd, so any successful lookup
+          # below must have come through our plugin.
           if grep -q '^alice:' /etc/passwd; then
             echo "alice already in /etc/passwd; test would be meaningless" >&2
             exit 1
           fi
 
-          # Resolve via NSS. `getent` itself loads NSS plugins from the
-          # current /etc/nsswitch.conf, so this is the same code path
-          # sshd, ls, ps, sudo, etc. would take.
-          out=$(getent passwd alice)
-          echo "got: $out"
+          # The expected passwd line is fully deterministic except for the
+          # UID/GID, which the plugin computes from FNV-1a of the email and
+          # uses for both fields. Capture it once, build the exact expected
+          # row, compare with `=` rather than spot-grepping fragments.
+          assert_passwd_row() {
+            local name="$1" email="$2"
+            local out uid expected
+            out=$(getent passwd "$name") || {
+              echo "getent passwd $name returned no result" >&2
+              return 1
+            }
+            uid=$(printf '%s' "$out" | cut -d: -f3)
+            if ! [ "$uid" -eq "$uid" ] 2>/dev/null; then
+              echo "no integer uid in: $out" >&2
+              return 1
+            fi
+            expected="$name:x:$uid:$uid:$email:/home/$name:/bin/bash"
+            if [ "$out" != "$expected" ]; then
+              echo "passwd row mismatch for $name:" >&2
+              echo "  expected: $expected" >&2
+              echo "  got:      $out" >&2
+              return 1
+            fi
+            printf '%s\n' "$out"
+          }
 
-          # Format: alice:x:<uid>:<gid>:alice@dialo.ai:/home/alice:/bin/bash
-          echo "$out" | grep -q "^alice:" || { echo "no alice line"; exit 1; }
-          echo "$out" | grep -q "alice@dialo.ai" || { echo "no email gecos"; exit 1; }
-          echo "$out" | grep -q "/home/alice" || { echo "no home dir"; exit 1; }
+          assert_passwd_row alice alice@dialo.ai
+          assert_passwd_row bob   bob@dialo.ai
 
-          # bob is also resolvable
-          getent passwd bob | grep -q "bob@dialo.ai"
-
-          # stranger@other.com is filtered out by domain; must NOT resolve
-          if getent passwd stranger; then
-            echo "domain filter broken: stranger@other.com leaked through"
+          # Cross-domain stranger must NOT resolve (TAILSCALE_NSS_DOMAIN=dialo.ai).
+          if getent passwd stranger >/dev/null 2>&1; then
+            echo "domain filter broken: stranger@other.com leaked through" >&2
             exit 1
           fi
 
-          # UIDs must be deterministic across calls (this is the chown-storm
-          # invariant for persisted home dirs).
+          # UIDs must be deterministic across calls (the chown-storm
+          # invariant for persisted home dirs across container restarts).
           uid_a=$(getent passwd alice | cut -d: -f3)
           uid_b=$(getent passwd alice | cut -d: -f3)
-          [ "$uid_a" = "$uid_b" ] || { echo "uid not stable: $uid_a vs $uid_b"; exit 1; }
+          [ "$uid_a" = "$uid_b" ] || { echo "uid not stable: $uid_a vs $uid_b" >&2; exit 1; }
 
       - name: getent passwd by uid resolves
         env:
