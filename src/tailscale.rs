@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 
-use crate::config;
+use crate::{config, file_cache};
 
 /// Hard upper bound on how long any single NSS lookup can wait on
 /// tailscaled. NSS callers are interactive (shell prompts, `ls -l`) — anything
@@ -48,7 +48,13 @@ struct CacheEntry {
 static CACHE: Lazy<Mutex<Option<CacheEntry>>> = Lazy::new(|| Mutex::new(None));
 
 /// One synthesized UNIX user, derived from a tailnet peer.
-#[derive(Debug, Clone)]
+///
+/// Serializable so the side-car daemon can atomically write the live peer
+/// list to a file the NSS plugin reads on every lookup. JSON is overkill for
+/// just `{"email": "..."}` per user, but it keeps the on-disk format
+/// human-debuggable (`cat /run/tailscale-nss/users.json` and you can see what
+/// the daemon thinks the tailnet looks like).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TailnetUser {
     /// Full identity, e.g. `"alice@dialo.ai"`.
     pub email: String,
@@ -110,6 +116,20 @@ pub fn list_users() -> Result<Vec<TailnetUser>, Error> {
         }
     }
 
+    // Fast path: read the daemon-maintained file cache if it's fresh enough
+    // (the daemon refreshes every 5s and the file_cache module enforces a
+    // 2-minute hard staleness ceiling). Avoids the tailscaled HTTP round-trip
+    // entirely for the common case.
+    if let Ok(Some(users)) = file_cache::read() {
+        *guard = Some(CacheEntry {
+            fresh_until: now + CACHE_TTL,
+            users: users.clone(),
+        });
+        return Ok(users);
+    }
+
+    // Slow path: tailscaled directly. Used when the daemon isn't running
+    // (e.g. early boot, or someone has the plugin without the daemon).
     match list_users_uncached() {
         Ok(users) => {
             *guard = Some(CacheEntry {
@@ -128,6 +148,13 @@ pub fn list_users() -> Result<Vec<TailnetUser>, Error> {
             Err(err)
         }
     }
+}
+
+/// Direct tailscaled call, bypassing all caches. The daemon uses this on its
+/// poll cycle to refresh the file cache; the NSS plugin falls back to it on
+/// cache miss.
+pub fn fetch_uncached() -> Result<Vec<TailnetUser>, Error> {
+    list_users_uncached()
 }
 
 fn list_users_uncached() -> Result<Vec<TailnetUser>, Error> {

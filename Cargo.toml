@@ -6,10 +6,23 @@ description = "NSS plugin that synthesizes UNIX users from a tailnet's peer list
 license = "MIT"
 
 [lib]
-# `libnss_<name>.so.2` is what glibc looks for. cdylib gives us a clean .so
-# without Rust runtime symbol leakage. The `.2` suffix is added at install time.
+# Two consumers in the same package:
+#   * `cdylib` — `libnss_<name>.so.2` is what glibc dlopens. The `.2` suffix
+#     is renamed in at install time. cdylib gives us a clean shared object
+#     without Rust runtime symbol leakage.
+#   * `rlib` — needed so the side-car daemon (`src/bin/tailscale-nss-syncd.rs`)
+#     in this same package can `use nss_tailscale::tailscale::*;` and share
+#     the tailscaled client / file cache code with the plugin.
 name = "nss_tailscale"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+# Side-car daemon that polls tailscaled, atomically writes the result to
+# /run/tailscale-nss/users.json, and ensures /home/<user> exists for each
+# synthesized user. Lets every NSS lookup answer from a small file read
+# instead of paying a tailscaled round-trip on cache miss.
+[[bin]]
+name = "tailscale-nss-syncd"
+path = "src/bin/tailscale-nss-syncd.rs"
 
 [dependencies]
 libnss = "0.8"

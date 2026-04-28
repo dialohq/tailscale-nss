@@ -21,9 +21,10 @@ use libnss::interop::Response;
 use libnss::passwd::{Passwd, PasswdHooks};
 use libnss::{libnss_group_hooks, libnss_passwd_hooks};
 
-mod config;
-mod tailscale;
-mod uid;
+pub mod config;
+pub mod file_cache;
+pub mod tailscale;
+pub mod uid;
 
 struct TailscalePasswd;
 libnss_passwd_hooks!(tailscale, TailscalePasswd);
