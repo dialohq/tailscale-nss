@@ -41,8 +41,8 @@ pub fn allowed_domain() -> Option<&'static str> {
     DOMAIN.as_deref()
 }
 
-pub fn default_shell() -> String {
-    SHELL.clone()
+pub fn default_shell() -> &'static str {
+    &SHELL
 }
 
 pub fn socket_path() -> &'static str {

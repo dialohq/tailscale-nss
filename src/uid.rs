@@ -18,9 +18,16 @@ use crate::config;
 
 /// Stable UID for a tailnet email. Same input → same output, forever.
 pub fn for_email(email: &str) -> u32 {
+    let base = config::uid_base();
+    // Defensive: a misconfigured `TAILSCALE_NSS_UID_BASE >= i32::MAX` would
+    // make `span = 0` and the `%` below an integer divide-by-zero — which
+    // panics, which (under `panic = "abort"`) crashes the host process. A
+    // floor of 1 collapses everyone onto a single UID, which is *terrible*
+    // but not catastrophic; the unit-test on `lands_in_safe_range` will
+    // catch the misconfiguration on next CI run.
+    let span = ((i32::MAX as u32).saturating_sub(base)).max(1);
     let h = fnv1a64(email.as_bytes());
-    let span = (i32::MAX as u32) - config::uid_base();
-    config::uid_base() + ((h as u32) % span)
+    base + ((h as u32) % span)
 }
 
 /// FNV-1a 64-bit. Tiny, dependency-free, deterministic, well-distributed
