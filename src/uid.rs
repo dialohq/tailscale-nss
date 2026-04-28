@@ -55,4 +55,15 @@ mod tests {
         assert!(uid >= config::DEFAULT_UID_BASE);
         assert!(uid < i32::MAX as u32);
     }
+
+    /// Lock the FNV-1a output for known emails. The CI integration test
+    /// asserts `getent passwd alice` returns *exactly* this UID
+    /// (`.github/workflows/ci.yml`); changing the constants here without
+    /// updating both fails fast and loudly. If you ever want to tune the
+    /// hash or the UID base, update both call sites in the same PR.
+    #[test]
+    fn pinned_uids_for_ci_fixtures() {
+        assert_eq!(for_email("alice@dialo.ai"), 109_535_949);
+        assert_eq!(for_email("bob@dialo.ai"), 1_110_256_801);
+    }
 }

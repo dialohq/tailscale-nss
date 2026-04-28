@@ -179,34 +179,29 @@ jobs:
             exit 1
           fi
 
-          # The expected passwd line is fully deterministic except for the
-          # UID/GID, which the plugin computes from FNV-1a of the email and
-          # uses for both fields. Capture it once, build the exact expected
-          # row, compare with `=` rather than spot-grepping fragments.
-          assert_passwd_row() {
-            local name="$1" email="$2"
-            local out uid expected
-            out=$(getent passwd "$name") || {
-              echo "getent passwd $name returned no result" >&2
-              return 1
-            }
-            uid=$(printf '%s' "$out" | cut -d: -f3)
-            if ! [ "$uid" -eq "$uid" ] 2>/dev/null; then
-              echo "no integer uid in: $out" >&2
-              return 1
+          # The plugin synthesizes a fully deterministic passwd row, so we
+          # compare against the *exact* expected line. UIDs come from
+          # FNV-1a of the email — same constants as `src/uid.rs` and the
+          # `expected_alice`/`expected_bob` unit tests in that file. If the
+          # hash algorithm or UID base ever changes, those Rust tests fail
+          # first (loudly, on every cargo test); this assertion picks up
+          # the same drift one layer up.
+          assert_eq() {
+            if [ "$2" != "$3" ]; then
+              echo "passwd row mismatch for $1:" >&2
+              echo "  expected: $2" >&2
+              echo "  got:      $3" >&2
+              exit 1
             fi
-            expected="$name:x:$uid:$uid:$email:/home/$name:/bin/bash"
-            if [ "$out" != "$expected" ]; then
-              echo "passwd row mismatch for $name:" >&2
-              echo "  expected: $expected" >&2
-              echo "  got:      $out" >&2
-              return 1
-            fi
-            printf '%s\n' "$out"
           }
 
-          assert_passwd_row alice alice@dialo.ai
-          assert_passwd_row bob   bob@dialo.ai
+          assert_eq alice \
+            "alice:x:109535949:109535949:alice@dialo.ai:/home/alice:/bin/bash" \
+            "$(getent passwd alice)"
+
+          assert_eq bob \
+            "bob:x:1110256801:1110256801:bob@dialo.ai:/home/bob:/bin/bash" \
+            "$(getent passwd bob)"
 
           # Cross-domain stranger must NOT resolve (TAILSCALE_NSS_DOMAIN=dialo.ai).
           if getent passwd stranger >/dev/null 2>&1; then
@@ -214,20 +209,19 @@ jobs:
             exit 1
           fi
 
-          # UIDs must be deterministic across calls (the chown-storm
-          # invariant for persisted home dirs across container restarts).
-          uid_a=$(getent passwd alice | cut -d: -f3)
-          uid_b=$(getent passwd alice | cut -d: -f3)
-          [ "$uid_a" = "$uid_b" ] || { echo "uid not stable: $uid_a vs $uid_b" >&2; exit 1; }
-
       - name: getent passwd by uid resolves
         env:
           TAILSCALE_NSS_DOMAIN: dialo.ai
         run: |
           set -e
-          uid=$(getent passwd alice | cut -d: -f3)
-          back=$(getent passwd "$uid")
-          echo "$back" | grep -q "^alice:" || { echo "uid->name lookup broken"; exit 1; }
+          back=$(getent passwd 109535949)
+          expected="alice:x:109535949:109535949:alice@dialo.ai:/home/alice:/bin/bash"
+          if [ "$back" != "$expected" ]; then
+            echo "uid->name lookup mismatch:" >&2
+            echo "  expected: $expected" >&2
+            echo "  got:      $back" >&2
+            exit 1
+          fi
 
       - name: cleanup mock tailscaled
         if: always()
