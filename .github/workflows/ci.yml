@@ -50,8 +50,13 @@ jobs:
       - name: cargo clippy
         run: nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#clippy -c cargo clippy --all-targets -- -D warnings
 
-      - name: nix build (release artifact)
-        run: nix build .#packages.x86_64-linux.default --print-build-logs
+      - name: nix build (portable release artifact)
+        # Build the *portable* output — interpreter patched to
+        # `/lib64/ld-linux-x86-64.so.2` so the daemon binary runs on stock
+        # Linux. Nix-native consumers (e.g. the devenv image's flake)
+        # reference `.#packages.<sys>.tailscale-nss` directly via flake
+        # input and get the un-patched variant; CI never uploads that.
+        run: nix build .#packages.x86_64-linux.portable --print-build-logs
 
       - name: confirm NSS exports
         # If the build succeeds but doesn't export the symbols glibc looks
@@ -82,10 +87,26 @@ jobs:
           fi
           echo "all 10 NSS exports present"
 
-      - name: confirm daemon binary
+      - name: confirm daemon binary loads on stock glibc
+        # The point of the `portable` variant: the daemon's PT_INTERP
+        # should be `/lib64/ld-linux-x86-64.so.2`, the conventional Linux
+        # path, *not* `/nix/store/...glibc/...` which would ENOENT on any
+        # non-nix host.
         run: |
+          set -e
           test -x result/bin/tailscale-nss-syncd
           file result/bin/tailscale-nss-syncd | grep -q "ELF 64-bit LSB"
+          interp=$(readelf -p .interp result/bin/tailscale-nss-syncd | awk '/]/ {print $3}')
+          echo "PT_INTERP: $interp"
+          [ "$interp" = "/lib64/ld-linux-x86-64.so.2" ] || {
+            echo "FAIL: portable variant's interpreter is not the standard Linux path" >&2
+            exit 1
+          }
+          # Sanity: ldd against the runner's glibc (Ubuntu 24.04) must
+          # resolve everything. If it doesn't, the binary won't load on
+          # any real Linux.
+          ldd result/bin/tailscale-nss-syncd | tee /tmp/ldd.txt
+          ! grep -q "not found" /tmp/ldd.txt
 
       # Stash the artifacts so the integration job can pick them up without
       # rebuilding. The sources are just a couple of MB; keeping them as
